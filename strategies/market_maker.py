@@ -50,7 +50,6 @@ class MarketMaker:
         price_tick_tolerance=2,   # 允許與目標價相差最多多少 ticks 就保留
         keep_within_tolerance=True  # True=保留接近的單，False=仍強制重掛
 ):
-    ):
         self.api_key = api_key
         self.secret_key = secret_key
         self.symbol = symbol
