@@ -859,65 +859,66 @@ class MarketMaker:
                 mid_price = current_price
             else:
                 mid_price = (bid_price + ask_price) / 2
-            
+    
             logger.info(f"市場中間價: {mid_price}")
-            
+    
             # 使用基礎價差
             spread_percentage = self.calculate_dynamic_spread()
             exact_spread = mid_price * (spread_percentage / 100.0)
             half = exact_spread / 2
-            
+    
             # === 庫存傾斜 ===
             inv_target = self.base_asset_target_percentage / 100.0
             inv_now = self.get_inventory_ratio()
             deviation = inv_now - inv_target
             bias = self.k_inv * deviation
             bias = max(-0.5, min(0.5, bias))  # 限制偏移幅度 ±50%
-            
+    
             base_buy_price  = mid_price - half * (1 + bias)
             base_sell_price = mid_price + half * (1 - bias)
             # === END ===
-            
-            base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
+    
+            base_buy_price  = round_to_tick_size(base_buy_price,  self.tick_size)
             base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
-            
+    
             actual_spread = base_sell_price - base_buy_price
-            actual_spread_pct = (actual_spread / mid_price) * 100
-            logger.info(f"使用的價差: {actual_spread_pct:.4f}% (目標: {spread_percentage}%), 絕對價差: {actual_spread}")
-            
-                    buy_prices, sell_prices = [], []
-        seen_buys, seen_sells = set(), set()
-
-        for i in range(self.max_orders):
-            # 非線性遞增梯度：越外側檔位距離越大
-            gradient_factor = (i ** 1.5) * 1.5
-            buy_adjustment  = gradient_factor * self.tick_size
-            sell_adjustment = gradient_factor * self.tick_size
-
-            bp = round_to_tick_size(base_buy_price  - buy_adjustment,  self.tick_size)
-            sp = round_to_tick_size(base_sell_price + sell_adjustment, self.tick_size)
-
-            # 去重（tick 對齊後可能重疊）
-            if bp not in seen_buys:
-                seen_buys.add(bp)
-                buy_prices.append(bp)
-            if sp not in seen_sells:
-                seen_sells.add(sp)
-                sell_prices.append(sp)
-
-            # 確保價格單調（買價由高到低、賣價由低到高）
+            actual_spread_pct = (actual_spread / mid_price) * 100.0
+            logger.info(
+                f"使用的價差: {actual_spread_pct:.4f}% (目標: {spread_percentage}%), 絕對價差: {actual_spread}"
+            )
+    
+            # 生成梯度價格
+            buy_prices, sell_prices = [], []
+            seen_buys, seen_sells = set(), set()
+    
+            for i in range(self.max_orders):
+                # 非線性遞增梯度：越外側檔位距離越大
+                gradient_factor = (i ** 1.5) * 1.5
+                buy_adjustment  = gradient_factor * self.tick_size
+                sell_adjustment = gradient_factor * self.tick_size
+    
+                bp = round_to_tick_size(base_buy_price  - buy_adjustment,  self.tick_size)
+                sp = round_to_tick_size(base_sell_price + sell_adjustment, self.tick_size)
+    
+                # 去重（tick 對齊後可能重疊）
+                if bp not in seen_buys:
+                    seen_buys.add(bp)
+                    buy_prices.append(bp)
+                if sp not in seen_sells:
+                    seen_sells.add(sp)
+                    sell_prices.append(sp)
+    
+            # 價格單調（買價由高到低、賣價由低到高）
             buy_prices.sort(reverse=True)
             sell_prices.sort()
     
             # 7) Maker / post-only 安全檢查：不要跨過對手最優價
-            # 買單必須 < 最優賣價，賣單必須 > 最優買價；若等於也可能吃單，保守減/加 1 tick
-            safe_buy_cap  = round_to_tick_size(ask_price - self.tick_size, self.tick_size)
-            safe_sell_floor = round_to_tick_size(bid_price + self.tick_size, self.tick_size)
+            safe_buy_cap   = round_to_tick_size(ask_price - self.tick_size, self.tick_size)
+            safe_sell_floor= round_to_tick_size(bid_price + self.tick_size, self.tick_size)
+            buy_prices  = [min(p, safe_buy_cap)   for p in buy_prices]
+            sell_prices = [max(p, safe_sell_floor) for p in sell_prices]
     
-            buy_prices  = [min(p, safe_buy_cap)      for p in buy_prices]
-            sell_prices = [max(p, safe_sell_floor)   for p in sell_prices]
-    
-            # 再次去重與單調性（避免安全夾後重疊）
+            # 再去重與單調校正
             buy_prices  = sorted(set(buy_prices),  reverse=True)
             sell_prices = sorted(set(sell_prices))
     
@@ -925,7 +926,7 @@ class MarketMaker:
                 logger.error("目標價位生成失敗：buy/sell 任一為空")
                 return None, None
     
-            final_spread = sell_prices[0] - buy_prices[0]
+            final_spread     = sell_prices[0] - buy_prices[0]
             final_spread_pct = (final_spread / mid_price) * 100.0
             logger.info(
                 f"最終價差: {final_spread_pct:.4f}% "
@@ -935,7 +936,7 @@ class MarketMaker:
             return buy_prices, sell_prices
     
         except Exception as e:
-            logger.exception(f"計算價格失敗: {e}")
+            logger.exception("計算價格失敗", exc_info=e)
             return None, None
         
     def smart_refresh_orders(self, buy_targets: list, sell_targets: list):
