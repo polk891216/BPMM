@@ -1009,7 +1009,8 @@ class MarketMaker:
         # 重新拉餘額，防止超額下單
         balances = get_balance(self.api_key, self.secret_key)
         # 你原本已有 _adjust_quantity_by_market 或數量計算邏輯，這裡直接沿用
-        buy_qty, sell_qty = self._adjust_quantity_by_market()
+        buy_qty  = self._adjust_quantity_by_market(self.order_quantity, "buy")
+        sell_qty = self._adjust_quantity_by_market(self.order_quantity, "sell")
     
         # 買邊
         for ti, tgt in enumerate(buy_targets):
