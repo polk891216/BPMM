@@ -252,6 +252,9 @@ def run_market_maker_command(api_key, secret_key, ws_proxy=None):
     quantity = float(quantity_input) if quantity_input.strip() else None
     max_orders = int(input("請輸入每側(買/賣)最大訂單數 (例如: 3): "))
     
+    # 倉位傾斜設置
+    k_inv = float(input("庫存傾斜係數 k_inv [0.3]: ") or 0.3)
+    
     # 配置重平設置
     enable_rebalance, base_asset_target_percentage, rebalance_threshold = configure_rebalance_settings()
     
