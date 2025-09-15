@@ -45,8 +45,11 @@ class MarketMaker:
         rebalance_threshold=15.0,
         enable_rebalance=True,
         base_asset_target_percentage=30.0,
-        ws_proxy=None
+        ws_proxy=None,
         k_inv=0.3,   # 庫存傾斜係數 (建議 0.2~0.6)
+        price_tick_tolerance=2,   # 允許與目標價相差最多多少 ticks 就保留
+        keep_within_tolerance=True  # True=保留接近的單，False=仍強制重掛
+):
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -56,6 +59,10 @@ class MarketMaker:
         self.max_orders = max_orders
         self.rebalance_threshold = rebalance_threshold
         self.k_inv = float(k_inv)
+
+        # 智能掛單撤單參數
+        self.price_tick_tolerance = int(price_tick_tolerance)
+        self.keep_within_tolerance = bool(keep_within_tolerance)
         
         # 新增重平設置參數
         self.enable_rebalance = enable_rebalance
@@ -833,6 +840,13 @@ class MarketMaker:
             return 0.5
 
         return (base_qty * price) / total_val
+
+    def _price_close(self, p1: float, p2: float, ticks_tol: int = None) -> bool:
+        """判斷兩個價格是否在 ticks 容忍範圍內"""
+        if p1 is None or p2 is None:
+            return False
+        tol = self.tick_size * (ticks_tol if ticks_tol is not None else self.price_tick_tolerance)
+        return abs(float(p1) - float(p2)) <= tol
     
     def calculate_prices(self):
         """計算買賣訂單價格"""
@@ -872,33 +886,160 @@ class MarketMaker:
             actual_spread_pct = (actual_spread / mid_price) * 100
             logger.info(f"使用的價差: {actual_spread_pct:.4f}% (目標: {spread_percentage}%), 絕對價差: {actual_spread}")
             
-            # 計算梯度訂單價格
-            buy_prices = []
-            sell_prices = []
-            
-            # 優化梯度分佈：較小的梯度以提高成交率
-            for i in range(self.max_orders):
-                # 非線性遞增的梯度，靠近中間的訂單梯度小，越遠離中間梯度越大
-                gradient_factor = (i ** 1.5) * 1.5
-                
-                buy_adjustment = gradient_factor * self.tick_size
-                sell_adjustment = gradient_factor * self.tick_size
-                
-                buy_price = round_to_tick_size(base_buy_price - buy_adjustment, self.tick_size)
-                sell_price = round_to_tick_size(base_sell_price + sell_adjustment, self.tick_size)
-                
-                buy_prices.append(buy_price)
-                sell_prices.append(sell_price)
-            
+                    buy_prices, sell_prices = [], []
+        seen_buys, seen_sells = set(), set()
+
+        for i in range(self.max_orders):
+            # 非線性遞增梯度：越外側檔位距離越大
+            gradient_factor = (i ** 1.5) * 1.5
+            buy_adjustment  = gradient_factor * self.tick_size
+            sell_adjustment = gradient_factor * self.tick_size
+
+            bp = round_to_tick_size(base_buy_price  - buy_adjustment,  self.tick_size)
+            sp = round_to_tick_size(base_sell_price + sell_adjustment, self.tick_size)
+
+            # 去重（tick 對齊後可能重疊）
+            if bp not in seen_buys:
+                seen_buys.add(bp)
+                buy_prices.append(bp)
+            if sp not in seen_sells:
+                seen_sells.add(sp)
+                sell_prices.append(sp)
+
+            # 確保價格單調（買價由高到低、賣價由低到高）
+            buy_prices.sort(reverse=True)
+            sell_prices.sort()
+    
+            # 7) Maker / post-only 安全檢查：不要跨過對手最優價
+            # 買單必須 < 最優賣價，賣單必須 > 最優買價；若等於也可能吃單，保守減/加 1 tick
+            safe_buy_cap  = round_to_tick_size(ask_price - self.tick_size, self.tick_size)
+            safe_sell_floor = round_to_tick_size(bid_price + self.tick_size, self.tick_size)
+    
+            buy_prices  = [min(p, safe_buy_cap)      for p in buy_prices]
+            sell_prices = [max(p, safe_sell_floor)   for p in sell_prices]
+    
+            # 再次去重與單調性（避免安全夾後重疊）
+            buy_prices  = sorted(set(buy_prices),  reverse=True)
+            sell_prices = sorted(set(sell_prices))
+    
+            if not buy_prices or not sell_prices:
+                logger.error("目標價位生成失敗：buy/sell 任一為空")
+                return None, None
+    
             final_spread = sell_prices[0] - buy_prices[0]
-            final_spread_pct = (final_spread / mid_price) * 100
-            logger.info(f"最終價差: {final_spread_pct:.4f}% (最低賣價 {sell_prices[0]} - 最高買價 {buy_prices[0]} = {final_spread})")
-            
+            final_spread_pct = (final_spread / mid_price) * 100.0
+            logger.info(
+                f"最終價差: {final_spread_pct:.4f}% "
+                f"(最低賣價 {sell_prices[0]} - 最高買價 {buy_prices[0]} = {final_spread})"
+            )
+    
             return buy_prices, sell_prices
-        
+    
         except Exception as e:
-            logger.error(f"計算價格時出錯: {str(e)}")
+            logger.exception(f"計算價格失敗: {e}")
             return None, None
+        
+    def smart_refresh_orders(self, buy_targets: list, sell_targets: list):
+        """
+        只刷新必要的單：對每個目標價位，若已有接近的掛單則保留；否則補掛。
+        對於遠離目標或多餘的掛單才取消。
+        """
+        # 1) 讀現有掛單（或用你維護的 self.active_buy_orders/self.active_sell_orders）
+        open_orders = get_open_orders(self.api_key, self.secret_key, symbol=self.symbol)
+        if not isinstance(open_orders, list):
+            open_orders = []
+    
+        buy_open = [o for o in open_orders if o.get('side') == 'BUY']
+        sell_open = [o for o in open_orders if o.get('side') == 'SELL']
+    
+        # 2) 標記要保留/要取消
+        to_keep_ids = set()
+        to_cancel_ids = set()
+    
+        # 將現有掛單與目標價位做「貪婪匹配」：每個目標價對應到一張最接近的單
+        def match_side(open_list, targets):
+            used = [False] * len(open_list)
+            matched_targets = [False] * len(targets)
+            keep_ids = set()
+            # 先嘗試精準匹配（在 ticks 容忍內）
+            for ti, tgt in enumerate(targets):
+                best_idx, best_diff = -1, float('inf')
+                for oi, o in enumerate(open_list):
+                    if used[oi]:
+                        continue
+                    px = float(o.get('price', 0))
+                    diff = abs(px - tgt)
+                    if diff < best_diff:
+                        best_diff, best_idx = diff, oi
+                if best_idx >= 0:
+                    px = float(open_list[best_idx].get('price', 0))
+                    if self.keep_within_tolerance and self._price_close(px, tgt):
+                        keep_ids.add(open_list[best_idx].get('orderId') or open_list[best_idx].get('id'))
+                        used[best_idx] = True
+                        matched_targets[ti] = True
+            return keep_ids, matched_targets, used
+    
+        buy_keep, buy_matched, buy_used = match_side(buy_open, buy_targets)
+        sell_keep, sell_matched, sell_used = match_side(sell_open, sell_targets)
+        to_keep_ids |= buy_keep
+        to_keep_ids |= sell_keep
+    
+        # 其餘未用到的現有單 → 取消
+        for idx, o in enumerate(buy_open):
+            if not buy_used[idx]:
+                to_cancel_ids.add(o.get('orderId') or o.get('id'))
+        for idx, o in enumerate(sell_open):
+            if not sell_used[idx]:
+                to_cancel_ids.add(o.get('orderId') or o.get('id'))
+    
+        # 3) 執行取消（僅限需要取消的）
+        if to_cancel_ids:
+            logger.info(f"智能刷新：取消 {len(to_cancel_ids)} 張價位偏離的單")
+            # 先嘗試批量取消；失敗再逐筆
+            try:
+                cancel_all_orders(self.api_key, self.secret_key, symbol=self.symbol, order_ids=list(to_cancel_ids))
+            except Exception:
+                for oid in list(to_cancel_ids):
+                    try:
+                        cancel_order(self.api_key, self.secret_key, symbol=self.symbol, order_id=oid)
+                    except Exception as e:
+                        logger.warning(f"取消訂單失敗 id={oid}: {e}")
+    
+        # 4) 為尚未匹配的目標價位補單
+        # 重新拉餘額，防止超額下單
+        balances = get_balance(self.api_key, self.secret_key)
+        # 你原本已有 _adjust_quantity_by_market 或數量計算邏輯，這裡直接沿用
+        buy_qty, sell_qty = self._adjust_quantity_by_market()
+    
+        # 買邊
+        for ti, tgt in enumerate(buy_targets):
+            if buy_matched[ti]:
+                continue
+            if buy_qty <= 0:
+                break
+            try:
+                resp = execute_order(self.api_key, self.secret_key, symbol=self.symbol,
+                                     side='BUY', type='LIMIT', price=tgt, quantity=buy_qty,
+                                     timeInForce='GTC', postOnly=True)
+                if isinstance(resp, dict) and resp.get('orderId'):
+                    logger.info(f"補掛買單: {tgt} x {buy_qty}")
+            except Exception as e:
+                logger.warning(f"補掛買單失敗 {tgt}: {e}")
+    
+        # 賣邊
+        for ti, tgt in enumerate(sell_targets):
+            if sell_matched[ti]:
+                continue
+            if sell_qty <= 0:
+                break
+            try:
+                resp = execute_order(self.api_key, self.secret_key, symbol=self.symbol,
+                                     side='SELL', type='LIMIT', price=tgt, quantity=sell_qty,
+                                     timeInForce='GTC', postOnly=True)
+                if isinstance(resp, dict) and resp.get('orderId'):
+                    logger.info(f"補掛賣單: {tgt} x {sell_qty}")
+            except Exception as e:
+                logger.warning(f"補掛賣單失敗 {tgt}: {e}")
     
     def need_rebalance(self):
         """判斷是否需要重平衡倉位（基於總餘額包含抵押品）"""
@@ -1656,8 +1797,20 @@ class MarketMaker:
                 if self.need_rebalance():
                     self.rebalance_position()
                 
-                # 下限價單
-                self.place_limit_orders()
+                # 下限價單（更新為：智能刷新，不全撤全掛）
+                buy_targets, sell_targets = self.calculate_prices()
+                if buy_targets and sell_targets:
+                    try:
+                        self.smart_refresh_orders(buy_targets, sell_targets)
+                    except Exception as e:
+                        logger.warning(f"智能刷新掛單失敗，改用舊版全撤全掛回退：{e}")
+                        # 回退機制（僅當智能刷新失敗時使用）
+                        self.cancel_existing_orders()
+                        # 若你的 place_limit_orders() 內部會自行計算價格，直接呼叫即可；
+                        # 如果它需要傳入價格，就改為 self.place_limit_orders(buy_targets, sell_targets)
+                        self.place_limit_orders()
+                else:
+                    logger.warning("本輪價格計算失敗（buy/sell 目標為空），跳過刷新")
                 
                 # 估算利潤
                 self.estimate_profit()
