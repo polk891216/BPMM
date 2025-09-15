@@ -46,6 +46,7 @@ class MarketMaker:
         enable_rebalance=True,
         base_asset_target_percentage=30.0,
         ws_proxy=None
+        k_inv=0.3,   # 庫存傾斜係數 (建議 0.2~0.6)
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -54,6 +55,7 @@ class MarketMaker:
         self.order_quantity = order_quantity
         self.max_orders = max_orders
         self.rebalance_threshold = rebalance_threshold
+        self.k_inv = float(k_inv)
         
         # 新增重平設置參數
         self.enable_rebalance = enable_rebalance
@@ -805,6 +807,32 @@ class MarketMaker:
         
         # 返回基礎價差，不再進行動態計算
         return base_spread
+
+    def get_inventory_ratio(self) -> float:
+        """
+        計算基礎資產(市值)在總資產的比例 (0~1)。
+        取不到數據時回傳 0.5。
+        """
+        balances = get_balance(self.api_key, self.secret_key)
+        ticker = get_ticker(self.symbol)
+        if not isinstance(balances, dict) or not isinstance(ticker, dict):
+            return 0.5
+    
+        price = float(ticker.get("price") or ticker.get("last") or 0.0)
+        if price <= 0:
+            return 0.5
+    
+        # 假設 symbol 是 "SOL_USDC"
+        base, quote = self.symbol.split("_")
+    
+        base_qty = float(balances.get(base, {}).get("available", 0.0))
+        quote_qty = float(balances.get(quote, {}).get("available", 0.0))
+    
+        total_val = base_qty * price + quote_qty
+        if total_val <= 0:
+            return 0.5
+
+        return (base_qty * price) / total_val
     
     def calculate_prices(self):
         """計算買賣訂單價格"""
@@ -822,11 +850,20 @@ class MarketMaker:
             logger.info(f"市場中間價: {mid_price}")
             
             # 使用基礎價差
-            spread_percentage = self.base_spread_percentage
-            exact_spread = mid_price * (spread_percentage / 100)
+            spread_percentage = self.calculate_dynamic_spread()
+            exact_spread = mid_price * (spread_percentage / 100.0)
+            half = exact_spread / 2
             
-            base_buy_price = mid_price - (exact_spread / 2)
-            base_sell_price = mid_price + (exact_spread / 2)
+            # === 庫存傾斜 ===
+            inv_target = self.base_asset_target_percentage / 100.0
+            inv_now = self.get_inventory_ratio()
+            deviation = inv_now - inv_target
+            bias = self.k_inv * deviation
+            bias = max(-0.5, min(0.5, bias))  # 限制偏移幅度 ±50%
+            
+            base_buy_price  = mid_price - half * (1 + bias)
+            base_sell_price = mid_price + half * (1 - bias)
+            # === END ===
             
             base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
             base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
